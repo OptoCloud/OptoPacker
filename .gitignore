@@ -1,0 +1,6 @@
+# Go vendor directory
+vendor/
+
+# generated files
+*.exe
+cache.json
