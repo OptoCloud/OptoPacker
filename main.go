@@ -10,10 +10,11 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	ignore "github.com/sabhiram/go-gitignore"
@@ -141,19 +142,9 @@ func FileHash(path string) ([]byte, uint64, error) {
 	return hash.Sum(nil), size, nil
 }
 
-type FileInfo struct {
-	Path string
-	Hash []byte
-	Size uint64
-}
-
 var outputFilePath string
 
-var crawlerResult []FileInfo
-var crawlerResultMtx sync.Mutex
-var crawlerWaitGroup sync.WaitGroup
-
-func crawl(cwdPath, gitignoreBasePath string, gitignore *ignore.GitIgnore) {
+func crawl(cwdPath, gitignoreBasePath string, gitignore *ignore.GitIgnore) []string {
 	if FileExists(filepath.Join(cwdPath, ".gitignore")) {
 		ignore, err := ignore.CompileIgnoreFile(filepath.Join(cwdPath, ".gitignore"))
 		if err == nil {
@@ -167,7 +158,7 @@ func crawl(cwdPath, gitignoreBasePath string, gitignore *ignore.GitIgnore) {
 		log.Fatalln("[0] ERR:" + err.Error())
 	}
 
-	var paths []FileInfo
+	var paths []string
 	for _, entry := range entries {
 		entryPath, err := filepath.Abs(filepath.Join(cwdPath, entry.Name()))
 		if err != nil {
@@ -191,38 +182,18 @@ func crawl(cwdPath, gitignoreBasePath string, gitignore *ignore.GitIgnore) {
 
 		if entry.IsDir() {
 			if entry.Name() != ".git" {
-				crawlAsync(entryPath, gitignoreBasePath, gitignore)
+				paths = append(paths, crawl(entryPath, gitignoreBasePath, gitignore)...)
 			}
 		} else {
 			if entryPath == outputFilePath {
 				continue
 			}
 
-			hash, size, err := FileHash(entryPath)
-			if err != nil {
-				log.Fatalln("[3] ERR: " + err.Error())
-			}
-
-			paths = append(paths, FileInfo{
-				Path: entryPath,
-				Hash: hash,
-				Size: size,
-			})
+			paths = append(paths, entryPath)
 		}
 	}
 
-	crawlerResultMtx.Lock()
-	defer crawlerResultMtx.Unlock()
-
-	log.Println(cwdPath)
-	crawlerResult = append(crawlerResult, paths...)
-}
-func crawlAsync(cwdPath, gitignoreBasePath string, gitignore *ignore.GitIgnore) {
-	crawlerWaitGroup.Add(1)
-	go func() {
-		defer crawlerWaitGroup.Done()
-		crawl(cwdPath, gitignoreBasePath, gitignore)
-	}()
+	return paths
 }
 
 type BlobRecord struct {
@@ -312,6 +283,25 @@ func (dr *DirectoryRecord) Write(file *os.File, hash *hash.Hash) (uint64, error)
 
 	return total, err
 }
+
+type FileInfo struct {
+	Path string
+	Hash []byte
+	Size uint64
+}
+
+/*
+   hash, size, err := FileHash(entryPath)
+   if err != nil {
+       log.Fatalln("[3] ERR: " + err.Error())
+   }
+
+   paths = append(paths, FileInfo{
+       Path: entryPath,
+       Hash: hash,
+       Size: size,
+   })
+*/
 
 func (pf *PackedFile) RegisterFile(fileInfo FileInfo, relPath string) {
 	blobFound := false
@@ -413,6 +403,28 @@ func (pf *PackedFile) WriteAll(file *os.File) (uint64, error) {
 	return total, err
 }
 
+func randSlice(slice *[]string) {
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(*slice), func(i, j int) { (*slice)[i], (*slice)[j] = (*slice)[j], (*slice)[i] })
+}
+func chunkSlice(slice []string, chunkSize int) [][]string {
+	var chunks [][]string
+
+	for i := 0; i < len(slice); i += chunkSize {
+		end := i + chunkSize
+
+		// necessary check to avoid slicing beyond
+		// slice capacity
+		if end > len(slice) {
+			end = len(slice)
+		}
+
+		chunks = append(chunks, slice[i:end])
+	}
+
+	return chunks
+}
+
 func main() {
 	if len(os.Args) != 3 {
 		println("Usage: Packer.exe InputFolder OutputFile")
@@ -420,7 +432,7 @@ func main() {
 	}
 
 	var err error
-	var relPath string
+	//var relPath string
 
 	inputDir := os.Args[1]
 	outputFile := os.Args[2]
@@ -443,38 +455,54 @@ func main() {
 	}
 	defer file.Close()
 
-	jsondata, err := ioutil.ReadFile("cache.json")
+	var filePaths []string
+	filePathsCache, err := ioutil.ReadFile("cache-paths.json")
 	if err == nil {
-		log.Println("Loading from cache...")
-		json.Unmarshal(jsondata, &crawlerResult)
+		log.Println("Loading paths from cache...")
+		json.Unmarshal(filePathsCache, &filePaths)
 	} else {
 		log.Println("Crawling...")
-		crawl(inputDir, "", nil)
-		crawlerWaitGroup.Wait()
-		jsondata, _ = json.MarshalIndent(crawlerResult, "", " ")
-		_ = ioutil.WriteFile("cache.json", jsondata, 0644)
+		filePaths = crawl(inputDir, "", nil)
+		filePathsCache, _ = json.MarshalIndent(filePaths, "", " ")
+		_ = ioutil.WriteFile("cache-paths.json", filePathsCache, 0644)
+	}
+
+	var fileRecords []FileRecord
+	fileRecordCache, err := ioutil.ReadFile("cache-records.json")
+	if err == nil {
+		log.Println("Loading records from cache...")
+		json.Unmarshal(filePathsCache, &fileRecords)
+	} else {
+		log.Println("Hashing records...")
+
+		randSlice(&filePaths)
+		chunkSlice(filePaths, runtime.NumCPU())
+
+		fileRecords = crawl(inputDir, "", nil)
+		filePathsCache, _ = json.MarshalIndent(filePaths, "", " ")
+		_ = ioutil.WriteFile("cache-paths.json", filePathsCache, 0644)
 	}
 
 	var document PackedFile
 	document.RootDirectory.Name = "."
 
-	lastPrint := time.Now()
-	log.Println("Indexing files...")
-	for i, entry := range crawlerResult {
-		relPath, err = filepath.Rel(inputDir, entry.Path)
-		if err != nil {
-			log.Fatalln("[4] ERR: " + err.Error())
+	log.Println("Indexing files...") /*
+		lastPrint := time.Now()
+		for i, entry := range crawlerResult {
+			relPath, err = filepath.Rel(inputDir, entry.Path)
+			if err != nil {
+				log.Fatalln("[4] ERR: " + err.Error())
+			}
+
+			document.RegisterFile(entry, relPath)
+
+			if time.Since(lastPrint).Seconds() > 0.25 {
+				percentComplete := (float32(i) / float32(len(crawlerResult))) * 100.
+				log.Printf("Indexing files... %.2f%% done\n", percentComplete)
+				lastPrint = time.Now()
+			}
 		}
 
-		document.RegisterFile(entry, relPath)
-
-		if time.Since(lastPrint).Seconds() > 0.25 {
-			percentComplete := (float32(i) / float32(len(crawlerResult))) * 100.
-			log.Printf("Indexing files... %.2f%% done\n", percentComplete)
-			lastPrint = time.Now()
-		}
-	}
-
-	log.Println("Writing to file...")
-	document.WriteAll(file)
+		log.Println("Writing to file...")
+		document.WriteAll(file)*/
 }
