@@ -468,19 +468,20 @@ func main() {
 	}
 
 	var fileRecords []FileRecord
-	fileRecordCache, err := ioutil.ReadFile("cache-records.json")
+	fileRecordsCache, err := ioutil.ReadFile("cache-records.json")
 	if err == nil {
 		log.Println("Loading records from cache...")
-		json.Unmarshal(filePathsCache, &fileRecords)
+		json.Unmarshal(fileRecordsCache, &fileRecords)
 	} else {
 		log.Println("Hashing records...")
 
 		randSlice(&filePaths)
-		chunkSlice(filePaths, runtime.NumCPU())
+		workLoads := chunkSlice(filePaths, runtime.NumCPU())
 
-		fileRecords = crawl(inputDir, "", nil)
-		filePathsCache, _ = json.MarshalIndent(filePaths, "", " ")
-		_ = ioutil.WriteFile("cache-paths.json", filePathsCache, 0644)
+        
+
+		fileRecordsCache, _ = json.MarshalIndent(fileRecords, "", " ")
+		_ = ioutil.WriteFile("cache-records.json", fileRecordsCache, 0644)
 	}
 
 	var document PackedFile
